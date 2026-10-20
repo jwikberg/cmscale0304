@@ -83,6 +83,11 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: ${{ needs.build.outputs.zip }}
+          path: dist
+          skip-decompress: true # keep the zip as uploaded instead of extracting its contents
+
+      - name: List downloaded files
+        run: ls -l dist
 
       - name: Create draft release
         env:
@@ -90,7 +95,7 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
           ZIP: ${{ needs.build.outputs.zip }}
         run: |
-          gh release create "v$VERSION" "$ZIP" \
+          gh release create "v$VERSION" "dist/$ZIP" \
             --repo "$GITHUB_REPOSITORY" \
             --draft \
             --target "$GITHUB_SHA" \
