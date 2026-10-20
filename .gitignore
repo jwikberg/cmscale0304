@@ -1,1 +1,3 @@
 dsound.dll
+build/
+dist/

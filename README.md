@@ -103,11 +103,29 @@ Each option's doc gives its own share.
 
 ## Building
 
-The build needs mingw-w64 (`i686-w64-mingw32-gcc`):
+The build needs mingw-w64 (`i686-w64-mingw32-gcc` and `i686-w64-mingw32-windres`):
 
 ```sh
-./build.sh        # writes dsound.dll next to the script
+./mingw-build.sh  # writes dsound.dll next to the script
 ```
+
+### Versions and releases
+
+Releases are git tags named `vX.Y.Z`. The build stamps the version into the DLL, where Explorer shows it under
+Properties > Details. `tools/version.sh` works it out from the tags:
+
+- A build of a release tag gets the release version, such as `1.2.0`.
+- Any other build gets a prerelease of the next patch version, such as `1.2.1-dev.5+g1a2b3c4`: 5 commits after
+  `v1.2.0`, at commit `1a2b3c4`.
+
+`CMSCALE_VERSION=1.3.0 ./mingw-build.sh` sets the version by hand.
+
+GitHub Actions builds every push to main and every pull request. Each run's page offers `cmscale-<version>.zip`, with
+the DLL, the ini, this README and the license.
+
+To make a release, run the **Release** workflow from the Actions tab on main. Pick `patch`, `minor` or `major`, or
+type an exact version. The workflow builds the zip and creates a draft release with generated notes. Review the draft
+on the Releases page and publish it. Publishing creates the `vX.Y.Z` tag, and later builds of main count from it.
 
 `src/par_sites.h` lists the 1 145 game instructions that `par_matches` redirects. `tools/par_sites.py` generates it
 from the 4.1.5 exe with GNU `objdump`:
