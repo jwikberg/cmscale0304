@@ -9,7 +9,7 @@ cmscale is a drop-in `dsound.dll` for Championship Manager 03/04, version 4.1.5.
 - **Scaling and widescreen.** cmscale scales the game to any window size or to your desktop resolution and keeps the
   aspect ratio. Fullscreen no longer switches your monitor to 1024×768.
 - **Faster day processing.** A three-month holiday takes about 60% less time, and creating a new game with every
-  league takes 29% less. Match days are faster too.
+  league takes about 22% less. Match days are faster too.
 - **Fixes and extras.** The mouse pointer stops blinking (Wine), idle screens stop using a whole CPU core, and the startup
   logos are gone. The mouse's back/forward buttons work, and highlights in the matches you watch can play faster.
 
@@ -100,7 +100,7 @@ runs.
 |---|---|---|
 | Three-month holiday on a 57 MB save (England down to the Third Division, plus Spain and Sweden) | 982 s | 375–379 s (−62%) |
 | 13-month holiday on the same save, to the next August | | 1 175 s, against 1 629 s without `par_scan` (−28%) |
-| Creating a new game with every league selected | 555 s | 392 s (−29%) |
+| Creating a new game with every league selected | 555 s | 431 s (−22%) |
 | Idle screen | ~100% of a core | 3–7% |
 
 Each option's doc gives its own share.
@@ -183,9 +183,10 @@ Each doc covers one option: how it works, how it was found and how it was checke
 - `par_matches` was checked on match days, a three-month holiday and new-game creation. Rarer situations, such as cup
   replays, extra time or the end of a season, may run code that those tests didn't reach. If the game crashes during
   processing, try `par_matches=0`.
-- `par_scan` was checked with a verify mode on two two-week holidays (July 2003 and August 2004) and run through a
-  13-month holiday, but the analysis behind it covered searches from July and August. If the game crashes during
-  processing, try `par_scan=0`.
+- `par_scan` was checked with a verify mode on two two-week holidays (July 2003 and August 2004), run through a
+  13-month holiday and through creating a new game with every league, where its searches stay on one thread. The
+  analysis behind it covered searches from July and August. If the game crashes or stops during processing, try
+  `par_scan=0`.
 
 ## Disclaimer
 

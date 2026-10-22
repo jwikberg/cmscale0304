@@ -42,6 +42,7 @@ search touches. Together they showed:
 | About 25 globals: context passed between evaluation functions, a one-entry date cache, the value function's statics, the date functions' results | scratch shared by all threads | per-thread copies (below) |
 | A placeholder manager, which the game points at any club without a manager and then evaluates | one shared object, set for different clubs within a search | a copy per thread |
 | A 200-slot cache of lightweight player views | shared cache | lock-free on a hit, a lock on a miss |
+| Clubs' staff records, whose data the game rebuilds lazily (the first time it's needed each day) | rebuilt while others read it | the lock, around every call that can rebuild them |
 | The global random number generator, drawn from in the fallback and for young players' values | order-dependent | a random stream per candidate (below) |
 | One flag in the loan search that, once set, adds a test for every later candidate | carried over | a short serial prefix (below) |
 | Guarded singleton pointers that the game fills in on first use | first-use race | filled in beforehand (below) |
@@ -57,11 +58,12 @@ waits, then copies the result variables from the first slice with the strictly h
 loop. Workers use the game thread's x87 control word and MXCSR.
 
 **Per-thread copies.** `tools/scan_sites.py` lists the 397 instructions that address the shared globals
-(`src/scan_sites.h`). Each becomes a jump to a thunk that loads a pointer to the thread's own copy from a TLS slot and
-runs the instruction against it. A slot of 0 means the real globals. That's the case on the game thread and on any
-thread that isn't a search worker, so they behave exactly as stock. A worker's copy is taken from the globals at the
-start of each search. The thunk saves the flags around its own test, and handles memory operands with an absolute
-address, indexed ones and the `moffs` moves, as well as `mov reg,imm` and `push imm` of an address.
+(`src/scan_sites.h`), in five blocks. Each instruction becomes a jump to a thunk: `push r; mov r,fs:[slot]`, the
+instruction with `[r + offset]` in place of its absolute address, then `pop r`. Each block has its own TLS slot. On
+the game thread and on every other thread, cmscale sets the slots to the globals' own addresses when the thread
+starts, so they behave exactly as stock. On a search worker they point to the worker's copy, taken from the globals at
+the start of each search. The thunk touches no flags. It handles memory operands with an absolute address, indexed
+ones and the `moffs` moves, as well as `mov reg,imm` and `push imm` of an address.
 
 **The placeholder manager.** Each worker gets a copy of the heap block that holds it, taken at each search, and the
 game's ten loads of the placeholder pointer read the thread's own pointer. After the merge, the last value the game
@@ -75,6 +77,20 @@ search gives exactly the result a serial search with the same streams would.
 **The loan search's flag.** It only ever goes from 0 to 1, and when a search sets it, it does so within the first 64
 candidates in 99.7% of cases. So the first 64 candidates run alone first, and the other slices start with the flag as
 the prefix left it. If a slice sets it after all, the slices after the first one that did run again with it set.
+
+**Clubs' staff records.** Each club keeps a list of staff records, and the game rebuilds a record's data lazily:
+`0x75a190` rebuilds it if it wasn't refreshed today, and `0x7feff0` does when the club has changed since. A rebuild
+frees the old data. On a holiday the game refreshes the records before the searches start, but every call that can
+rebuild them takes the lock anyway.
+
+**Creating a new game.** The game builds every club's first shortlist there (`SHORTLIST_MAN::setup`) while it also
+builds clubs' staff records, and split searches crashed on records destroyed under them. cmscale keeps the searches
+of that phase on the game thread.
+
+**Memory.** The exe can address 2 GB, and creating a new game with every league already uses nearly all of it. The
+first version gave its 8 workers 4 MB stacks each, and `par_matches` 64 fixture slots of 1 MB. That ran the game out of
+memory ("Memory is dangerously low!") during new-game creation. The workers now have 1 MB stacks, like the game
+thread, and `par_matches` has 16 slots.
 
 **First-use races.** The compiler sets a function-local static's guard bit before it stores the value. If two workers
 run such code for the first time together, the second can find the bit set and the pointer still 0. `tools/singletons.py`
@@ -108,7 +124,12 @@ same random streams, and compared the six result variables:
 | 13–27 Aug 2004 (new season, from the end of a 13-month holiday) | 19 311 transfer, 3 689 loan | 0 |
 
 The 13-month holiday with `par_scan=8` split 208 000 transfer and 39 000 loan searches and completed and saved
-normally. Normal play confirmed it.
+normally. With the final version, the verify runs above were repeated (again 0 differences), and creating a new game
+with every league completed. Normal play confirmed it.
+
+New-game creation was tested only after the first version shipped, and it found three problems: the memory, the
+staff records and the destroyed records above. A write watch over holiday searches can't see code that only runs the
+first time a club is set up.
 
 ## Measured
 
@@ -119,6 +140,7 @@ normally. Normal play confirmed it.
 | Two weeks, 13–27 Jul 2003 | 89–91 s | 51–52 s (−43%) |
 | Two weeks, 13–27 Aug 2004 | 140–141 s | 90 s (−36%) |
 | 13 months, 13 Jul 2003 to 13 Aug 2004 | 1 629 s | 1 175 s (−28%) |
+| Creating a new game with every league | 413 s | 431 s (its searches stay on the game thread) |
 
 By month in the 13-month run, transfer windows took 31–40% less time and quiet months 8–26% less. 4 threads give
 most of the gain, about −29% on the July fortnight, and 8 a little more.
@@ -127,5 +149,6 @@ most of the gain, about −29% on the July fortnight, and 8 a little more.
 
 - Results differ from a run without `par_scan`, as they do between two stock runs. The random numbers inside a
   search come from per-candidate streams, not from the game's generator in order. Each draw is still uniform.
-- The write watch and the probe covered searches from July and August. A rare path at another time of year may touch
-  shared state they didn't see. If the game crashes during processing, try `par_scan=0`.
+- The write watch and the probe covered searches from July and August, and new-game creation turned up shared state
+  that holidays didn't reach. A rare path at another time of year may touch shared state the tests didn't see. If the
+  game crashes or stops during processing, try `par_scan=0`.

@@ -1254,7 +1254,8 @@ static int install_par_tls(void)
  * Each worker runs with the game thread's x87 control word and MXCSR (the game computes in x87 floats), on a
  * stack as large as the game thread's (1 MB). */
 #define PAR_MAX 16   /* simulations at a time (par_matches) */
-#define PAR_SLOTS 64 /* fixtures set up and waiting in one batch */
+#define PAR_SLOTS 16 /* fixtures set up and waiting in one batch. Each is a thread with a 1 MB stack, and creating a
+                       new game with every league already uses nearly all of the game's 2 GB address space */
 static struct par_worker {
     HANDLE thread, run, handoff, go_sim, sim_done, go_post;
     DWORD id, self, args[4];
@@ -1562,12 +1563,15 @@ static int install_prefetch(void)
  * - the context globals 0xd56128..0xd56147, the date memo 0xd56740..0xd5674b, the player value function
  *   0x60ab40's statics 0xd526e0..0xd52763, the placeholder manager pointer 0xd55f94 and the date functions'
  *   statics 0xeedc7c..0xeedc9f (0x977410 and 0x977540 return their address): every instruction that
- *   refers to them (tools/scan_sites.py) goes through a thunk that addresses the thread's own area instead (a TLS
- *   slot holds a pointer to it), or the globals themselves when the slot is 0, as on the game thread and any
- *   thread that isn't a scan worker. A worker's area is a copy of the globals, taken at each scan, except that
+ *   refers to them (tools/scan_sites.py) goes through a thunk that addresses the block through a TLS slot per block:
+ *   push r; mov r,fs:[slot]; the instruction with [r + offset in the block]; pop r (no flags touched). The slots
+ *   hold the globals' own addresses on the game thread and every other thread (set when each thread starts), and
+ *   the thread's own area on a scan worker. A worker's area is a copy of the globals, taken at each scan, except that
  *   its placeholder pointer points to the worker's clone of the placeholder (a copy of the heap block holding it).
  *   The placeholder is what 0x75a410, 0x75a280 and 0x757930 point at a club and evaluate;
  * - the virtual-player cache 0x6df070: a hit is checked without a lock (it only reads), a miss takes a lock;
+ * - clubs' staff records, whose data 0x75a190 and 0x7feff0 rebuild lazily: every call that can rebuild them takes
+ *   the lock;
  * - draws on the global RNG 0xeef510: on a scan thread they come from a stream per candidate, seeded from the
  *   scan's seed (one draw of the real RNG when the scan starts) and the candidate's index. Draws inside
  *   0x6ce5e0, which a slice calls for more candidates than a serial scan does (it doesn't know earlier slices'
@@ -1585,7 +1589,12 @@ static int install_prefetch(void)
  * - the loan loop's flag at +0x13: once a candidate sets it, every later candidate gets one more test. It only goes
  *   from 0 to 1. The first SCAN_PREFIX candidates run alone first (a scan that sets it does so there in 99.7% of
  *   cases), and the other slices start with the value the prefix ends with. If a slice sets it after all, the
- *   slices after the first that did run again, together, starting with it set. */
+ *   slices after the first that did run again, together, starting with it set;
+ * - creating a new game (SHORTLIST_MAN::setup, 0x6a4660) builds clubs' staff records while it scans, and split scans
+ *   there hit destroyed records: its scans stay on the game thread.
+ *
+ * Workers have 1 MB stacks, as the game thread: creating a new game with every league already uses nearly all of
+ * the game's 2 GB address space. */
 
 #include "scan_sites.h"
 #include "singletons.h"
@@ -1648,9 +1657,11 @@ _Static_assert(offsetof(struct scan_job, frame) == 0x28 && offsetof(struct scan_
 
 static struct scan_job scan_jobs[SCAN_MAX];
 static struct scan_thread scan_main;
-static DWORD scan_tls = TLS_OUT_OF_INDEXES, scan_area_slot = TLS_OUT_OF_INDEXES;
+static DWORD scan_tls = TLS_OUT_OF_INDEXES, scan_block_slot[5]; /* per scan_sites block: the base its code uses */
+static int scan_slots_ready;
 static const DWORD scan_area_off[5] = {0, 0x20, 0x2c, 0xb0, 0xb4}; /* each scan_sites block's offset in a worker's area */
 static CRITICAL_SECTION scan_lock;
+static volatile int scan_in_setup; /* inside SHORTLIST_MAN::setup (new game): scans stay on the game thread */
 static DWORD scan_warm_ph; /* the placeholder pointer the warm-up counts are for */
 static DWORD scan_seed, scan_scans;
 static DWORD scan_ph_seen, scan_ph_start, scan_ph_size; /* the placeholder's heap block, found once per pointer */
@@ -1712,7 +1723,7 @@ static DWORD __attribute__((thiscall)) scan_gate(void *self, DWORD a, DWORD b, D
 static void scan_ph_set(int k, DWORD self, DWORD v)
 {
     struct scan_thread *t = scan_self();
-    DWORD *area = TlsGetValue(scan_area_slot), ph = area ? area[scan_area_off[3] / 4] : SCAN_PLACEHOLDER;
+    DWORD ph = *(DWORD *)TlsGetValue(scan_block_slot[3]); /* this thread's placeholder pointer */
     if (!t || !t->stream || !ph || self - ph + 0x400 >= 0x800)
         return;
     t->ph_cand[k] = t->cand, t->ph_off[k] = self - (k ? 0x94 : 0x7c) - ph, t->ph_val[k] = v;
@@ -1793,7 +1804,8 @@ static DWORD WINAPI scan_worker(void *arg)
     TlsSetValue(scan_tls, &job->st);
     for (;;) {
         WaitForSingleObject(job->go, INFINITE);
-        TlsSetValue(scan_area_slot, job->area);
+        for (int b = 0; b < 5; b++)
+            TlsSetValue(scan_block_slot[b], (BYTE *)job->area + scan_area_off[b]);
         __asm__ volatile("fninit\n\tfldcw %0\n\tldmxcsr %1" : : "m"(job->fpucw), "m"(job->mxcsr));
         scan_enter_slice(job);
         job->st.base = 0;
@@ -1944,7 +1956,7 @@ static int scan_head(struct scan_loop *l, DWORD *esp)
         return 0;
     if (SCAN_PLACEHOLDER != scan_warm_ph) /* a save was loaded: warm up again */
         scan_warm_ph = SCAN_PLACEHOLDER, scan_loops[0].warm = scan_loops[1].warm = 0;
-    if ((int)esp[l->end / 4] >= SCAN_MIN && l->warm++ >= SCAN_WARMUP && GetCurrentThreadId() == game_thread_id &&
+    if ((int)esp[l->end / 4] >= SCAN_MIN && !scan_in_setup && l->warm++ >= SCAN_WARMUP && GetCurrentThreadId() == game_thread_id &&
         !(scan_lock.RecursionCount && (DWORD)(DWORD_PTR)scan_lock.OwningThread == game_thread_id)) /* the workers need it */
         return scan_parallel(l, esp);
     return 0;
@@ -1989,16 +2001,14 @@ __asm__("scan_loan_exit_stub:\n"
         "pushal\npushfl\nlea 0x24(%esp),%eax\npush %eax\ncall scan_exit\nadd $4,%esp\ntest %eax,%eax\njnz scan_leave_slice\n"
         "popfl\npopal\nmov 0x40(%esp),%edi\ncmp $-1,%edi\njmp *scan_exit_cont+4\n");
 
-/* The thunk for one site. r, a register the instruction doesn't use (or the target register of kind 1), gets the
- * thread's area, or the globals' address minus the block's area offset when there is none; then the instruction
- * runs with [r + area offset + (target - block)] in place of [target]. Flags are kept: the test is between pushfd
- * and popfd, and popfd comes before the instruction, which may set them itself. Returns the thunk's end, or NULL
- * for a form it can't rewrite. */
+/* The thunk for one site: r, a register the instruction doesn't use (or the target register of kind 1), gets this
+ * thread's base for the block from its TLS slot, then the instruction runs with [r + (target - block)] in place of
+ * [target]. Only push, mov, lea and xchg are added, so the flags are untouched. Returns the thunk's end, or NULL for a
+ * form it can't rewrite. */
 static BYTE *scan_thunk(BYTE *q, const struct scan_site *p)
 {
     const BYTE *code = (const BYTE *)p->addr;
-    DWORD off = scan_area_off[p->block] + (p->target - scan_blocks[p->block][0]);
-    DWORD fallback = scan_blocks[p->block][0] - scan_area_off[p->block];
+    DWORD off = p->target - scan_blocks[p->block][0], slot = 0xe10 + 4 * scan_block_slot[p->block];
     int form = 0, at = p->pos, used = 1 << 4, r = p->reg; /* form: 1 modrm disp32, 2 SIB without base, 3 moffs */
     if (p->kind == 0 || p->kind == 3) {
         static const int prefer[] = {3, 6, 7, 2, 1, 5, 0};
@@ -2016,25 +2026,17 @@ static BYTE *scan_thunk(BYTE *q, const struct scan_site *p)
                 r = prefer[i];
         if (r < 0)
             return NULL;
-    } else if (p->kind == 2) {
+    } else if (p->kind == 2)
         r = 0;                                                         /* push imm32: the address, via eax */
-        *q++ = 0x8d, *q++ = 0x64, *q++ = 0x24, *q++ = 0xfc;            /* lea esp,[esp-4]: room for it */
-    }
     if (p->kind != 1)
         *q++ = 0x50 + r;                                               /* push r */
-    *q++ = 0x9c;                                                       /* pushfd */
     *q++ = 0x64, *q++ = 0x8b, *q++ = 0x05 | r << 3;                    /* mov r,fs:[TlsSlots[slot]] */
-    *(DWORD *)q = 0xe10 + 4 * scan_area_slot, q += 4;
-    *q++ = 0x85, *q++ = 0xc0 | r << 3 | r;                             /* test r,r */
-    *q++ = 0x75, *q++ = 5;                                             /* jnz +5 */
-    *q++ = 0xb8 + r, *(DWORD *)q = fallback, q += 4;                   /* mov r,fallback */
-    *q++ = 0x9d;                                                       /* popfd */
+    *(DWORD *)q = slot, q += 4;
     if (p->kind == 1) {                                                /* lea r,[r+off] */
         *q++ = 0x8d, *q++ = 0x80 | r << 3 | r, *(DWORD *)q = off, q += 4;
-    } else if (p->kind == 2) {                                         /* lea eax,[eax+off]; mov [esp+4],eax; pop eax */
+    } else if (p->kind == 2) {                                         /* lea eax,[eax+off]; xchg eax,[esp] */
         *q++ = 0x8d, *q++ = 0x80, *(DWORD *)q = off, q += 4;
-        *q++ = 0x89, *q++ = 0x44, *q++ = 0x24, *q++ = 0x04;
-        *q++ = 0x58;
+        *q++ = 0x87, *q++ = 0x04, *q++ = 0x24;
     } else {
         if (form == 3) {                                               /* mov al/eax <-> [moffs], as modrm forms */
             memcpy(q, code, at - 1), q += at - 1;
@@ -2055,6 +2057,14 @@ static BYTE *scan_thunk(BYTE *q, const struct scan_site *p)
     *q++ = 0xe9;
     *(DWORD *)q = (p->addr + p->len) - (DWORD)(q + 4);
     return q + 4;
+}
+
+/* every thread's slots start at the globals themselves (DllMain sets them for each new thread) */
+static void scan_init_thread_slots(void)
+{
+    if (scan_slots_ready)
+        for (int b = 0; b < 5; b++)
+            TlsSetValue(scan_block_slot[b], (void *)scan_blocks[b][0]);
 }
 
 static int scan_patch_sites(void)
@@ -2111,6 +2121,42 @@ static DWORD __attribute__((thiscall)) scan_vp(DWORD person)
     return r;
 }
 
+/* A club's staff records (the array at club+0xdc) carry data that is refreshed lazily: 0x75a190 finds the club's
+ * type-3 record and, if its date stamp isn't today, rebuilds its data (0x7fec80 frees and reallocates it) before
+ * stamping it; 0x75a590 does that and then reads the data in 0x7feff0, which rebuilds it too when the club's version
+ * has moved on. On holidays the records are refreshed before the scans; when a new game is created, a club's first
+ * refresh can happen inside a split scan, and two workers rebuilding or reading the same record crashed on freed
+ * memory. Every call of 0x75a590 (from the loan scan, 0x6c2763, and the main scan's gated check, 0x6ce7bb) and the
+ * other three calls of 0x75a190 run under the scan lock. */
+typedef DWORD (__attribute__((thiscall)) *club_check_fn)(DWORD, DWORD, DWORD);
+typedef DWORD (__attribute__((thiscall)) *club_record_fn)(DWORD);
+static DWORD __attribute__((thiscall)) scan_club_check(DWORD club, DWORD a, DWORD b)
+{
+    EnterCriticalSection(&scan_lock);
+    DWORD r = ((club_check_fn)0x75a590)(club, a, b);
+    LeaveCriticalSection(&scan_lock);
+    return r;
+}
+static DWORD __attribute__((thiscall)) scan_club_record(DWORD club)
+{
+    EnterCriticalSection(&scan_lock);
+    DWORD r = ((club_record_fn)0x75a190)(club);
+    LeaveCriticalSection(&scan_lock);
+    return r;
+}
+
+/* Creating a new game (SHORTLIST_MAN::setup, 0x6a4660, which builds every club's first shortlist) runs its scans on
+ * the game thread: there clubs' staff records are first built, and split scans crashed on records destroyed under
+ * them (a pure virtual call at 0x756dd2) even with the record lock. Holidays never showed it. */
+typedef void (__attribute__((thiscall)) *setup_fn)(DWORD);
+static setup_fn scan_setup_orig;
+static void __attribute__((thiscall)) scan_setup(DWORD self)
+{
+    scan_in_setup++;
+    scan_setup_orig(self);
+    scan_in_setup--;
+}
+
 static int install_par_scan(void)
 {
     if (cfg.par_scan > SCAN_MAX)
@@ -2118,8 +2164,13 @@ static int install_par_scan(void)
     InitializeCriticalSectionAndSpinCount(&scan_lock, 4000); /* held briefly: spin before sleeping */
     if (!cfg.par_matches)
         InitializeCriticalSection(&par_rng_lock);
-    if ((scan_tls = TlsAlloc()) == TLS_OUT_OF_INDEXES || (scan_area_slot = TlsAlloc()) >= 64) /* in the TEB itself */
+    if ((scan_tls = TlsAlloc()) == TLS_OUT_OF_INDEXES)
         return 0;
+    for (int b = 0; b < 5; b++)
+        if ((scan_block_slot[b] = TlsAlloc()) >= 64) /* the thunks address the slot in the TEB itself */
+            return 0;
+    scan_slots_ready = 1;
+    scan_init_thread_slots();
     TlsSetValue(scan_tls, &scan_main);
     if (memcmp((void *)SCAN_HEAD, "\x8b\x74\x24\x70\x8b\x0e", 6) || memcmp((void *)SCAN_EXIT, "\x8b\x74\x24\x7c\x83\xfe\xff", 7) ||
         memcmp((void *)SCAN_LOAN_HEAD, "\x8b\x54\x24\x28\x8b\x4c\x24\x44", 8) ||
@@ -2143,13 +2194,17 @@ static int install_par_scan(void)
     if (!(scan_patch_sites() &&
           (scan_vp_orig = (vp_fn)make_tramp(0x6df070, 6)) && patch_jmp(0x6df070, "\x64\xa1\x00\x00\x00\x00", 6, scan_vp) &&
           patch_jmp(SCAN_GATE, "\x6a\xff\x68\x90\xe3\xa6\x00", 7, scan_gate) &&
+          patch_call(0x6c2763, 0x75a590, scan_club_check) && patch_call(0x6ce7bb, 0x75a590, scan_club_check) &&
+          patch_call(0x507c2e, 0x75a190, scan_club_record) && patch_call(0x6c4337, 0x75a190, scan_club_record) &&
+          patch_call(0x6c46d8, 0x75a190, scan_club_record) &&
+          (scan_setup_orig = (setup_fn)make_tramp(0x6a4660, 6)) && patch_jmp(0x6a4660, "\x55\x8b\xec\x83\xe4\xf8", 6, scan_setup) &&
           probe(0x75fde0, 7, scan_set7c) && probe(0x65eb30, 10, scan_set94)))
         return 0;
     for (int i = 0; i < cfg.par_scan; i++) {
         struct scan_job *job = &scan_jobs[i];
         job->go = CreateEventA(NULL, FALSE, FALSE, NULL);
         job->done = CreateEventA(NULL, FALSE, FALSE, NULL);
-        job->thread = CreateThread(NULL, 4 << 20, scan_worker, job, STACK_SIZE_PARAM_IS_A_RESERVATION, &job->id);
+        job->thread = CreateThread(NULL, 1 << 20, scan_worker, job, STACK_SIZE_PARAM_IS_A_RESERVATION, &job->id); /* as the game thread's */
         if (!job->go || !job->done || !job->thread)
             return 0;
     }
@@ -2323,9 +2378,9 @@ HRESULT WINAPI DirectSoundCreate(LPCGUID guid, void **ds, IUnknown *outer)
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
-    if (reason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(inst);
+    if (reason == DLL_PROCESS_ATTACH)
         install();
-    }
+    else if (reason == DLL_THREAD_ATTACH)
+        scan_init_thread_slots(); /* par_scan's TLS slots start at the globals themselves */
     return TRUE;
 }

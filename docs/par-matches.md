@@ -58,7 +58,7 @@ before patching it.
 1. A worker thread runs the whole of `0x61b7b0` and stops when it reaches the simulation. Fixtures that finish
    without a simulation finish there.
 2. The game thread returns to the day loop, which moves on to the next fixture.
-3. The batch runs at the end of each fixture list, after 64 fixtures, and whenever the game thread plays a fixture
+3. The batch runs at the end of each fixture list, after 16 fixtures, and whenever the game thread plays a fixture
    itself. The game thread starts the simulations in fixture order, K at a time (K is `par_matches`), and starts the
    next as soon as one ends. Then each worker records its fixture in turn, and the game thread shows its score.
 
@@ -108,8 +108,10 @@ A trace of every batch over a three-month holiday showed where the waiting went:
 - Most fixture lists are tiny (104 of 268 had no simulation, 81 had one), but 38 lists with more than 8 simulations
   held 1 017 of the 1 253 simulations.
 
-Hence the queue: a batch now takes a whole fixture list, and the threads take the next simulation as soon as they're
-free. A batch can't span fixture lists. At the end of a list, the day loop asks the game's internal server for the next
+Hence the queue: a batch now takes up to 16 fixtures of a list, and the threads take the next simulation as soon as
+they're free. Each fixture in a batch waits on its own thread with a 1 MB stack. A first version allowed 64, and
+creating a new game with every league then ran out of the game's 2 GB of address space. 16 cost nothing measurable on
+holidays. A batch can't span fixture lists. At the end of a list, the day loop asks the game's internal server for the next
 one, and the server's work in between can depend on the results.
 
 ## Measured
@@ -119,7 +121,7 @@ one, and the server's work in between can depend on the results.
 | Wall | 804 s | 633 s | 608 s | 638 s | 603 s | 593 s |
 
 - From 4 threads up, the differences are within the noise between runs. The default is 8.
-- The queue per fixture list took a further 3% off a three-month holiday with `par_scan=8`: 375 and 379 s, against
+- The queue took a further 3% off a three-month holiday with `par_scan=8` (measured with 64 slots): 375 and 379 s, against
   388–391 s with batches of 8 fixtures. With 12 or 16 threads each simulation got slower and the wait stayed the
   same: the simulations are bound by memory, and the test machine has 4 fast cores.
 - With the queue, the first Continue on the pre-season save gave identical fingerprints for the 52 matches both runs
