@@ -80,7 +80,7 @@ static struct {
     int match_hl_speed; /* the watched match's highlights: 0 = stock (Real Time), 1 = Fast (3x), 2 = Very Fast (8x) */
     int match_speed_max; /* the watched match's Very Fast speed (stock 8) */
 } cfg = {
-    .zoom = 1.0, .borderless = 1, .filter = FILTER_SHARP, .opengl = 1, .max_fps = 120, .cursor_fix = 1,
+    .zoom = 1.0, .borderless = 1, .filter = FILTER_SHARP, .opengl = 1, .max_fps = 60, .cursor_fix = 1,
     .fast_sqrt = 1, .fast_rand = 2, .idle_wait = 1, .fast_dyncast = 1, .prefetch = 1, .par_matches = 8, .par_scan = 8,
     .skip_splash = 1, .mouse_nav = 1, .match_speed_max = 8,
 };
@@ -2218,7 +2218,7 @@ static void load_config(const char *dir)
     GetPrivateProfileStringA("cmscale", "renderer", "opengl", buf, sizeof buf, ini);
     cfg.opengl = _stricmp(buf, "gdi") != 0;
     cfg.vsync = GetPrivateProfileIntA("cmscale", "vsync", 0, ini);
-    cfg.max_fps = GetPrivateProfileIntA("cmscale", "max_fps", 120, ini);
+    cfg.max_fps = GetPrivateProfileIntA("cmscale", "max_fps", 60, ini);
     cfg.cursor_fix = GetPrivateProfileIntA("cmscale", "cursor_fix", 1, ini);
     cfg.prefetch = GetPrivateProfileIntA("cmscale", "prefetch", 1, ini);
     cfg.fast_dyncast = GetPrivateProfileIntA("cmscale", "fast_dyncast", 1, ini);

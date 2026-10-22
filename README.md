@@ -53,7 +53,7 @@ apply when the ini is missing or leaves an option out.
 | `renderer` | `opengl` | `opengl` scales on the GPU and uploads only the parts of the screen that changed. `gdi` is a slower CPU fallback, which cmscale also uses when OpenGL isn't available | [scaling](docs/scaling.md) |
 | `filter` | `sharp` | `sharp` gives crisp pixels with smooth edges, `smooth` is bilinear and `nearest` is blocky | [scaling](docs/scaling.md) |
 | `integer` | `0` | `1` scales only by whole multiples (2×, 3× and so on), with bigger black bars | [scaling](docs/scaling.md) |
-| `vsync`, `max_fps` | `0`, `120` | OpenGL only. `vsync=1` waits for vblank on each redraw, and `max_fps` caps redraws per second | [scaling](docs/scaling.md) |
+| `vsync`, `max_fps` | `0`, `60` | OpenGL only. `vsync=1` waits for vblank on each redraw, and `max_fps` caps redraws per second | [scaling](docs/scaling.md) |
 | `cursor_fix` | `1` | Stops the mouse pointer blinking when it moves over buttons, which happens under Wine | [cursor](docs/cursor.md) |
 
 ### Exact speed-ups
