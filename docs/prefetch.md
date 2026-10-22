@@ -65,4 +65,7 @@ It only reads, and it checks bounds and null pointers, so the game's results can
 - Creating a new game with every league selected spends most of its time in the same scan. There `prefetch` saves
   100 s, or 26% of the shortlisting phase.
 
+With [par_scan](par-scan.md) on, its stubs at the two loop heads call the prefetch, so each worker prefetches its own
+slice.
+
 Normal play confirmed it.

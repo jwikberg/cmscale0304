@@ -17,8 +17,9 @@
  *
  * cmscale also stops the pointer blinking under Wine (cursor_fix) and stops idle
  * screens spinning a core (idle_wait). It speeds up day processing with exact
- * replacements (fast_sqrt, fast_rand, fast_dyncast, prefetch) and by simulating
- * background matches on several threads (par_matches). It skips the startup logos
+ * replacements (fast_sqrt, fast_rand, fast_dyncast, prefetch), by simulating
+ * background matches on several threads (par_matches) and by splitting the AI's
+ * transfer and loan searches over several threads (par_scan). It skips the startup logos
  * (skip_splash), maps the mouse's back/forward buttons to the screen history
  * (mouse_nav) and changes the watched match's highlight and Very Fast speeds
  * (match_hl_speed, match_speed_max). docs/ explains each one.
@@ -31,6 +32,7 @@
 #include <xmmintrin.h>
 #include <GL/gl.h>
 #include <limits.h>
+#include <stddef.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,13 +74,14 @@ static struct {
     int fast_dyncast;   /* memoise dynamic_cast results per (vtable, types) */
     int prefetch;       /* prefetch shortlist candidates' data ahead of the AI's scan */
     int par_matches;    /* simulate background matches on this many threads */
+    int par_scan;       /* split the AI's transfer and loan searches over this many threads */
     int skip_splash;    /* skip the logos at startup, as a key press during them does */
     int mouse_nav;      /* mouse back/forward buttons go back/forward through the screen history */
     int match_hl_speed; /* the watched match's highlights: 0 = stock (Real Time), 1 = Fast (3x), 2 = Very Fast (8x) */
     int match_speed_max; /* the watched match's Very Fast speed (stock 8) */
 } cfg = {
     .zoom = 1.0, .borderless = 1, .filter = FILTER_SHARP, .opengl = 1, .max_fps = 120, .cursor_fix = 1,
-    .fast_sqrt = 1, .fast_rand = 2, .idle_wait = 1, .fast_dyncast = 1, .prefetch = 1, .par_matches = 8,
+    .fast_sqrt = 1, .fast_rand = 2, .idle_wait = 1, .fast_dyncast = 1, .prefetch = 1, .par_matches = 8, .par_scan = 8,
     .skip_splash = 1, .mouse_nav = 1, .match_speed_max = 8,
 };
 
@@ -1045,6 +1048,7 @@ static int patch_call(DWORD site, DWORD expect, void *target)
 #include "par_sites.h"
 
 static CRITICAL_SECTION par_tactics_lock, par_pool_lock, par_rng_lock;
+static void (__thiscall *const mt_seed)(void *, DWORD) = (void *)0x983af0; /* the game's Mersenne Twister seeding */
 
 /* A copy of fn's first len bytes (whole instructions, nothing relative), then a jmp to fn + len. */
 static BYTE *make_tramp(DWORD fn, int len)
@@ -1249,7 +1253,8 @@ static int install_par_tls(void)
  *
  * Each worker runs with the game thread's x87 control word and MXCSR (the game computes in x87 floats), on a
  * stack as large as the game thread's (1 MB). */
-#define PAR_MAX 16
+#define PAR_MAX 16   /* simulations at a time (par_matches) */
+#define PAR_SLOTS 64 /* fixtures set up and waiting in one batch */
 static struct par_worker {
     HANDLE thread, run, handoff, go_sim, sim_done, go_post;
     DWORD id, self, args[4];
@@ -1257,7 +1262,7 @@ static struct par_worker {
     short idx, count;
     WORD fpucw;
     DWORD mxcsr;
-} par_workers[PAR_MAX];
+} par_workers[PAR_SLOTS];
 static int par_pending; /* fixtures set up and waiting for their simulation, on workers 0 to par_pending - 1 */
 
 typedef int (__attribute__((thiscall)) *play_fn)(DWORD self, DWORD fixture, DWORD, DWORD, DWORD);
@@ -1279,7 +1284,7 @@ static DWORD WINAPI par_worker_main(void *arg)
 static struct par_worker *par_current(void)
 {
     DWORD id = GetCurrentThreadId();
-    for (int i = 0; i < cfg.par_matches; i++)
+    for (int i = 0; i < PAR_SLOTS; i++)
         if (par_workers[i].id == id)
             return &par_workers[i];
     return NULL;
@@ -1297,18 +1302,25 @@ static int par_simulate(struct par_worker *w, DWORD match, const DWORD *a)
     return r;
 }
 
-/* Game thread: simulate the pending fixtures together, then record them and show their scores in order. */
+/* Game thread: simulate the pending fixtures, in fixture order and par_matches at a time (the next starts as soon as
+ * one ends), then record them and show their scores in order. */
 static void par_run_batch(void)
 {
-    int n = par_pending;
+    int n = par_pending, order[PAR_SLOTS], sims = 0, running = 0;
+    HANDLE done[PAR_MAX];
     if (!n)
         return;
     for (int i = 0; i < n; i++)
         if (!par_workers[i].finished)
-            SetEvent(par_workers[i].go_sim);
-    for (int i = 0; i < n; i++)
-        if (!par_workers[i].finished)
-            WaitForSingleObject(par_workers[i].sim_done, INFINITE);
+            order[sims++] = i;
+    for (int next = 0; next < sims || running;) {
+        while (next < sims && running < cfg.par_matches) {
+            SetEvent(par_workers[order[next]].go_sim);
+            done[running++] = par_workers[order[next++]].sim_done;
+        }
+        DWORD r = WaitForMultipleObjects(running, done, FALSE, INFINITE) - WAIT_OBJECT_0;
+        done[r] = done[--running];
+    }
     for (int i = 0; i < n; i++) {
         struct par_worker *w = &par_workers[i];
         if (!w->finished) {
@@ -1336,14 +1348,14 @@ int __attribute__((thiscall)) play_async(DWORD self, DWORD fixture, DWORD a1, DW
     __asm__ volatile("fnstcw %0\n\tstmxcsr %1" : "=m"(w->fpucw), "=m"(w->mxcsr));
     SetEvent(w->run);
     WaitForSingleObject(w->handoff, INFINITE); /* set up (or finished without a simulation) */
-    if (par_pending == cfg.par_matches || w->idx >= w->count)
+    if (par_pending == PAR_SLOTS || w->idx >= w->count)
         par_run_batch();
     return 0;
 }
 
 static int install_par_workers(void)
 {
-    for (int i = 0; i < cfg.par_matches; i++) {
+    for (int i = 0; i < PAR_SLOTS; i++) {
         struct par_worker *w = &par_workers[i];
         w->run = CreateEventA(NULL, FALSE, FALSE, NULL);
         w->handoff = CreateEventA(NULL, FALSE, FALSE, NULL);
@@ -1375,7 +1387,9 @@ static int install_par(void)
 #define DYNCAST_BITS 12
 
 static void *(__cdecl *real_RTDynamicCast)(void *, LONG, void *, void *, int);
-static struct dyncast { DWORD vfptr; LONG delta; void *src, *dst; LONG adjust; int ok; } *dyncasts;
+/* seq is odd while an entry is written: casts run on several threads with par_matches and par_scan, so a reader
+ * that sees seq change (or odd) treats the entry as a miss, and a writer that can't claim it doesn't cache */
+static struct dyncast { volatile LONG seq; DWORD vfptr; LONG delta; void *src, *dst; LONG adjust; } *dyncasts;
 
 static void *__cdecl hook_RTDynamicCast(void *p, LONG delta, void *src, void *dst, int is_ref)
 {
@@ -1384,10 +1398,19 @@ static void *__cdecl hook_RTDynamicCast(void *p, LONG delta, void *src, void *ds
     DWORD vfptr = *(DWORD *)p;
     DWORD h = (vfptr ^ (DWORD)dst * 31 ^ (DWORD)src * 7 ^ (DWORD)delta) * 2654435761u >> (32 - DYNCAST_BITS);
     struct dyncast *d = &dyncasts[h];
-    if (d->ok && d->vfptr == vfptr && d->delta == delta && d->src == src && d->dst == dst)
-        return d->adjust == LONG_MIN ? NULL : (char *)p + d->adjust;
+    LONG seq = d->seq;
+    __asm__ volatile("" ::: "memory");
+    int hit = seq && !(seq & 1) && d->vfptr == vfptr && d->delta == delta && d->src == src && d->dst == dst;
+    LONG memo = d->adjust;
+    __asm__ volatile("" ::: "memory");
+    if (hit && d->seq == seq)
+        return memo == LONG_MIN ? NULL : (char *)p + memo;
     void *r = real_RTDynamicCast(p, delta, src, dst, is_ref);
-    *d = (struct dyncast){vfptr, delta, src, dst, r ? (char *)r - (char *)p : LONG_MIN, 1};
+    if (!(seq & 1) && InterlockedCompareExchange(&d->seq, seq + 1, seq) == seq) {
+        d->vfptr = vfptr, d->delta = delta, d->src = src, d->dst = dst, d->adjust = r ? (char *)r - (char *)p : LONG_MIN;
+        __asm__ volatile("" ::: "memory");
+        d->seq = seq + 2;
+    }
     return r;
 }
 
@@ -1511,11 +1534,629 @@ static int install_prefetch(void)
     static const BYTE expect[] = {0x8b, 0x74, 0x24, 0x70, 0x8b, 0x0e};             /* mov esi,[esp+70]; mov ecx,[esi] */
     static const BYTE expect_loan[] = {0x8b, 0x54, 0x24, 0x28, 0x8b, 0x4c, 0x24, 0x44}; /* mov edx,[esp+28]; mov ecx,[esp+44] */
     int ok = 0;
+    if (cfg.par_scan) /* par_scan's stubs at the loop heads call pf_candidate and pf_loan_candidate */
+        return 2;
     if (!memcmp((void *)PF_LOOP_HEAD, expect, sizeof expect))
         ok += probe(PF_LOOP_HEAD, sizeof expect, pf_candidate);
     if (!memcmp((void *)PF_LOAN_LOOP_HEAD, expect_loan, sizeof expect_loan))
         ok += probe(PF_LOAN_LOOP_HEAD, sizeof expect_loan, pf_loan_candidate);
     return ok;
+}
+
+/* ---- par_scan (docs/par-scan.md) ----
+ * SHORTLIST_MAN::get_playing_staff_for_position (0x6902d0) scores every player in the database for one requirement,
+ * ~60% of a long holiday. Its candidate loop (0x6904ad..0x691020) keeps the best candidate (a strictly higher score
+ * replaces it, so the first maximum wins), and the code after the loop reads only six frame slots: the best score
+ * (+0x58), the best person's id (+0x7c, -1 if none), the winner's figure (+0x64) and flags (+0x17, +0x1e), and the
+ * fallback (+0x6c). So a scan of at least SCAN_MIN candidates is split into par_scan slices. The loan variant
+ * (0x691140, loop 0x691351..0x691ad9) is split the same way: its result is the best score (+0x18) and id (+0x40), and
+ * one flag (+0x13) carries over between candidates (below). Each worker copies the function's frame (0xd8 bytes from
+ * esp at the loop head: locals, saved registers, SEH record, return address, arguments), sets its slice's index, end
+ * and candidate pointer, loads the game thread's registers and enters the loop at its head. The hook at the loop's
+ * exit hands the frame back when esp is the slice's frame (nested scans exit there too, at another esp). The game
+ * thread waits, takes the result slots from the first slice with the strictly highest best, and the fallback from
+ * the first slice that found one, and goes on after the loop.
+ *
+ * What the loop shares, and how:
+ * - per-candidate scratch (the value recomputed into the candidate, list cursors): each candidate is in one slice;
+ * - the context globals 0xd56128..0xd56147, the date memo 0xd56740..0xd5674b, the player value function
+ *   0x60ab40's statics 0xd526e0..0xd52763, the placeholder manager pointer 0xd55f94 and the date functions'
+ *   statics 0xeedc7c..0xeedc9f (0x977410 and 0x977540 return their address): every instruction that
+ *   refers to them (tools/scan_sites.py) goes through a thunk that addresses the thread's own area instead (a TLS
+ *   slot holds a pointer to it), or the globals themselves when the slot is 0, as on the game thread and any
+ *   thread that isn't a scan worker. A worker's area is a copy of the globals, taken at each scan, except that
+ *   its placeholder pointer points to the worker's clone of the placeholder (a copy of the heap block holding it).
+ *   The placeholder is what 0x75a410, 0x75a280 and 0x757930 point at a club and evaluate;
+ * - the virtual-player cache 0x6df070: a hit is checked without a lock (it only reads), a miss takes a lock;
+ * - draws on the global RNG 0xeef510: on a scan thread they come from a stream per candidate, seeded from the
+ *   scan's seed (one draw of the real RNG when the scan starts) and the candidate's index. Draws inside
+ *   0x6ce5e0, which a slice calls for more candidates than a serial scan does (it doesn't know earlier slices'
+ *   second best), come from a second stream per candidate, so they can't shift the others. The result is the
+ *   one a serial scan with the same streams gives, not the stock draws: like par_matches, results differ from a
+ *   serial run, as they do between two stock runs;
+ * - the placeholder manager's two fields (-0x7c and -0x94 from its setters' this): the last set on a clone, in
+ *   candidate order, is written back to the real one after the merge, as a serial scan would leave them;
+ * - one-time initialisation: MSVC sets a function-local static's guard bit before its value, so two threads running
+ *   such code for the first time together can read a null static. Before each split scan, every guarded singleton
+ *   static in the exe (tools/singletons.py: the pointers the game caches from its registry 0x983800) that the
+ *   registry can already fill is filled in, as the game's own first call would; and after a save is loaded (the
+ *   placeholder pointer changes), the first SCAN_WARMUP scans of each loop run serially, so other one-time
+ *   initialisation on the common paths happens on one thread;
+ * - the loan loop's flag at +0x13: once a candidate sets it, every later candidate gets one more test. It only goes
+ *   from 0 to 1. The first SCAN_PREFIX candidates run alone first (a scan that sets it does so there in 99.7% of
+ *   cases), and the other slices start with the value the prefix ends with. If a slice sets it after all, the
+ *   slices after the first that did run again, together, starting with it set. */
+
+#include "scan_sites.h"
+#include "singletons.h"
+
+#define SCAN_MAX 16
+#define SCAN_FRAME 0xd8      /* the main scan's frame; the loan scan's is 0x90, and copying more is harmless */
+#define SCAN_HEAD 0x6904ad   /* mov esi,[esp+0x70]; mov ecx,[esi] */
+#define SCAN_EXIT 0x691026   /* mov esi,[esp+0x7c]; cmp esi,-1 */
+#define SCAN_LOAN_HEAD 0x691351 /* mov edx,[esp+0x28]; mov ecx,[esp+0x44] */
+#define SCAN_LOAN_EXIT 0x691adf /* mov edi,[esp+0x40]; cmp edi,-1 */
+#define SCAN_PREFIX 64
+#define SCAN_MIN 2000      /* smaller scans stay on the game thread */
+#define SCAN_WARMUP 20     /* big scans of each loop run serially after a save is loaded */
+
+/* A candidate loop, as frame offsets from esp at its head. */
+static struct scan_loop {
+    DWORD head;
+    int index, end, cand; /* the loop's index, end and candidate entry pointer (0x14-byte entries) */
+    int cand_reg;         /* pushad slot of a register that also holds the candidate entry at the head, or -1 */
+    int nslots;           /* result slots (offset, size): best score, best id (-1 = none), then the winner's others */
+    int slots[5][2];
+    int first;            /* a slot taken from the first slice where it's non-zero (the fallback), or -1 */
+    int flag;             /* a byte that only goes from 0 to 1 and is read by later candidates, or -1 */
+    int warm;             /* big scans run serially since the last load (see SCAN_WARMUP) */
+} scan_loops[2] = {
+    {SCAN_HEAD, 0x98, 0x9c, 0x8c, 0, 5, {{0x58, 4}, {0x7c, 4}, {0x64, 4}, {0x17, 1}, {0x1e, 1}}, 0x6c, -1, 0},
+    {SCAN_LOAN_HEAD, 0x38, 0x3c, 0x28, -1, 2, {{0x18, 4}, {0x40, 4}}, -1, 0x13, 0},
+};
+#define SCAN_GATE 0x6ce5e0   /* thiscall, 4 stack arguments */
+#define SCAN_RNG 0xeef510
+#define SCAN_PLACEHOLDER (*(volatile DWORD *)0xd55f94)
+
+struct scan_thread {
+    DWORD base;          /* esp at the loop head of the slice this thread runs; 0 = none */
+    int stream;          /* draws on SCAN_RNG come from the candidate streams */
+    int cand, gate;      /* the outer loop's current candidate; depth inside 0x6ce5e0 */
+    int seeded[2];       /* the candidate each generator was last seeded for */
+    BYTE rng[2][0xa00];  /* RANDOM objects (Mersenne Twister state at +4) */
+    int ph_cand[2];      /* the placeholder's fields: candidate of the last set, offset from the placeholder, value */
+    DWORD ph_off[2], ph_val[2];
+};
+
+/* The asm below uses the first fields' offsets. */
+struct scan_job {
+    DWORD saved_esp;     /* +0: the worker's own esp while it runs the slice */
+    DWORD regs[8];       /* +4: registers at the loop head, pushad order (edi esi ebp esp ebx edx ecx eax); the
+                            esp slot holds the loop head's address */
+    DWORD align;         /* +0x24: the game thread's esp & 15 */
+    BYTE frame[SCAN_FRAME]; /* +0x28: in: the frame to run; out: the frame after the slice */
+    struct scan_thread st;  /* +0x100: st.base is written by the asm */
+    HANDLE thread, go, done;
+    DWORD id;
+    WORD fpucw;
+    DWORD mxcsr;
+    BYTE *clone;         /* this worker's copy of the placeholder's heap block */
+    DWORD clone_size;
+    DWORD area[0xd8 / 4]; /* this worker's copies of the scan_sites blocks (see scan_area_off) */
+};
+_Static_assert(offsetof(struct scan_job, frame) == 0x28 && offsetof(struct scan_job, st) == 0x100, "scan_job layout");
+
+static struct scan_job scan_jobs[SCAN_MAX];
+static struct scan_thread scan_main;
+static DWORD scan_tls = TLS_OUT_OF_INDEXES, scan_area_slot = TLS_OUT_OF_INDEXES;
+static const DWORD scan_area_off[5] = {0, 0x20, 0x2c, 0xb0, 0xb4}; /* each scan_sites block's offset in a worker's area */
+static CRITICAL_SECTION scan_lock;
+static DWORD scan_warm_ph; /* the placeholder pointer the warm-up counts are for */
+static DWORD scan_seed, scan_scans;
+static DWORD scan_ph_seen, scan_ph_start, scan_ph_size; /* the placeholder's heap block, found once per pointer */
+
+static inline struct scan_thread *scan_self(void)
+{
+    return scan_tls == TLS_OUT_OF_INDEXES ? NULL : TlsGetValue(scan_tls);
+}
+
+static DWORD scan_mix(DWORD x)
+{
+    x ^= x >> 16, x *= 0x85ebca6b, x ^= x >> 13, x *= 0xc2b2ae35, x ^= x >> 16;
+    return x;
+}
+
+/* From the rand hook, for a draw on a generator in the exe's data: which generator to use (eax) and whether to
+ * take par_rng_lock (edx). */
+unsigned long long __cdecl scan_rng_for(DWORD rng) __asm__("scan_rng_for");
+unsigned long long __cdecl scan_rng_for(DWORD rng)
+{
+    struct scan_thread *t = scan_self();
+    if (t && t->stream && rng == SCAN_RNG) {
+        int g = t->gate > 0;
+        if (t->seeded[g] != t->cand) {
+            mt_seed(t->rng[g] + 4, scan_mix(scan_seed ^ scan_mix((DWORD)t->cand * 2 + g)));
+            t->seeded[g] = t->cand;
+        }
+        return (DWORD)t->rng[g];
+    }
+    return rng | 1ull << 32;
+}
+
+/* 0x983ae0 (add ecx,4; jmp 0x983a50) becomes a jmp here when par_scan is on (it replaces par_rand) */
+void scan_rand(void) __asm__("scan_rand");
+__asm__("scan_rand:\n"
+        "cmp $0xd0a000,%ecx\njb 1f\ncmp $0xf96000,%ecx\njae 1f\n"
+        "push %ecx\ncall scan_rng_for\nadd $4,%esp\nmov %eax,%ecx\ntest %edx,%edx\njz 1f\n"
+        "push %ecx\npushl par_rng_lock_p\ncall *__imp__EnterCriticalSection@4\npop %ecx\n"
+        "pushl 4(%esp)\nadd $4,%ecx\nmov $0x983a50,%eax\ncall *%eax\n"
+        "push %eax\npush %edx\npushl par_rng_lock_p\ncall *__imp__LeaveCriticalSection@4\npop %edx\npop %eax\n"
+        "ret $4\n"
+        "1:\nadd $4,%ecx\nmov $0x983a50,%eax\njmp *%eax\n");
+
+/* 0x6ce5e0: draws inside it come from the candidate's second stream */
+typedef DWORD (__attribute__((thiscall)) *gate_fn)(void *, DWORD, DWORD, DWORD, DWORD);
+static gate_fn scan_gate_orig;
+static DWORD __attribute__((thiscall)) scan_gate(void *self, DWORD a, DWORD b, DWORD c, DWORD d)
+{
+    struct scan_thread *t = scan_self();
+    if (t && !t->gate++)
+        t->seeded[1] = -1; /* each call starts the stream again */
+    DWORD r = scan_gate_orig(self, a, b, c, d);
+    if (t)
+        t->gate--;
+    return r;
+}
+
+/* the placeholder manager's setters (0x75fde0: this-0x7c, 0x65eb30: this-0x94), on a scan thread */
+static void scan_ph_set(int k, DWORD self, DWORD v)
+{
+    struct scan_thread *t = scan_self();
+    DWORD *area = TlsGetValue(scan_area_slot), ph = area ? area[scan_area_off[3] / 4] : SCAN_PLACEHOLDER;
+    if (!t || !t->stream || !ph || self - ph + 0x400 >= 0x800)
+        return;
+    t->ph_cand[k] = t->cand, t->ph_off[k] = self - (k ? 0x94 : 0x7c) - ph, t->ph_val[k] = v;
+}
+static void __cdecl scan_set7c(DWORD *esp) { scan_ph_set(0, esp[-2], esp[1]); }
+static void __cdecl scan_set94(DWORD *esp) { scan_ph_set(1, esp[-2], esp[1]); }
+
+/* Worker: run the job's frame from the loop head on this thread's stack; returns when the hook at the loop exit
+ * finds this slice's frame. */
+void __cdecl scan_enter_slice(struct scan_job *job) __asm__("scan_enter_slice");
+__asm__("scan_enter_slice:\n"
+        "push %ebp\npush %ebx\npush %esi\npush %edi\n"
+        "mov 20(%esp),%eax\n"
+        "mov %esp,0(%eax)\n"
+        "sub $0x200,%esp\nand $-16,%esp\nor 0x24(%eax),%esp\n"   /* the game thread's alignment */
+        "mov %esp,%edi\nlea 0x28(%eax),%esi\nmov $0x36,%ecx\ncld\nrep movsl\n" /* 0xd8 / 4 */
+        "mov %esp,0x100(%eax)\n"
+        "pushl 16(%eax)\n"                                         /* the loop head */
+        "mov 4(%eax),%edi\nmov 8(%eax),%esi\nmov 12(%eax),%ebp\nmov 20(%eax),%ebx\nmov 24(%eax),%edx\n"
+        "mov 28(%eax),%ecx\nmov 32(%eax),%eax\n"
+        "ret\n");
+
+/* The loop exit's stub jumps here with the job in eax: back to scan_enter_slice's caller */
+void scan_leave_slice(void) __asm__("scan_leave_slice");
+__asm__("scan_leave_slice:\n"
+        "mov 0(%eax),%esp\npop %edi\npop %esi\npop %ebx\npop %ebp\nret\n");
+
+/* The heap block holding p: [*start, *start + *size), or 0 if none is found */
+static int scan_heap_block(DWORD p, DWORD *start, DWORD *size)
+{
+    HANDLE heaps[64];
+    DWORD nh = GetProcessHeaps(64, heaps);
+    for (DWORD h = 0; h < nh && h < 64; h++) {
+        PROCESS_HEAP_ENTRY he = {0};
+        int found = 0;
+        HeapLock(heaps[h]);
+        while (!found && HeapWalk(heaps[h], &he))
+            if (he.wFlags & PROCESS_HEAP_ENTRY_BUSY && p - (DWORD)he.lpData < he.cbData)
+                *start = (DWORD)he.lpData, *size = he.cbData, found = 1;
+        HeapUnlock(heaps[h]);
+        if (found)
+            return 1;
+    }
+    return 0;
+}
+
+/* Each worker's area for this scan: copies of the blocks, and its clone of the placeholder (or the real one) */
+static void scan_prepare_areas(int k)
+{
+    DWORD ph = SCAN_PLACEHOLDER;
+    if (ph != scan_ph_seen) {
+        scan_ph_seen = ph;
+        if (!ph || !scan_heap_block(ph, &scan_ph_start, &scan_ph_size) || scan_ph_size > 0x10000)
+            scan_ph_start = scan_ph_size = 0;
+    }
+    for (int s = 0; s < k; s++) {
+        struct scan_job *job = &scan_jobs[s];
+        for (int b = 0; b < 5; b++)
+            memcpy((BYTE *)job->area + scan_area_off[b], (void *)scan_blocks[b][0], scan_blocks[b][1] - scan_blocks[b][0]);
+        if (!scan_ph_size)
+            continue;
+        if (job->clone_size < scan_ph_size) {
+            if (job->clone)
+                VirtualFree(job->clone, 0, MEM_RELEASE);
+            job->clone = VirtualAlloc(NULL, scan_ph_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            job->clone_size = job->clone ? scan_ph_size : 0;
+        }
+        if (job->clone) {
+            memcpy(job->clone, (void *)scan_ph_start, scan_ph_size);
+            job->area[scan_area_off[3] / 4] = (DWORD)job->clone + (ph - scan_ph_start);
+        }
+    }
+}
+
+static DWORD WINAPI scan_worker(void *arg)
+{
+    struct scan_job *job = arg;
+    TlsSetValue(scan_tls, &job->st);
+    for (;;) {
+        WaitForSingleObject(job->go, INFINITE);
+        TlsSetValue(scan_area_slot, job->area);
+        __asm__ volatile("fninit\n\tfldcw %0\n\tldmxcsr %1" : : "m"(job->fpucw), "m"(job->mxcsr));
+        scan_enter_slice(job);
+        job->st.base = 0;
+        SetEvent(job->done);
+    }
+    return 0;
+}
+
+/* the result: the loop's slots, then its first-found slot (or 0) */
+static void scan_get(const struct scan_loop *l, const BYTE *frame, DWORD *v)
+{
+    for (int i = 0; i < l->nslots; i++)
+        v[i] = l->slots[i][1] == 4 ? *(const DWORD *)(frame + l->slots[i][0]) : frame[l->slots[i][0]];
+    v[l->nslots] = l->first >= 0 ? *(const DWORD *)(frame + l->first) : 0;
+}
+
+static void scan_put(const struct scan_loop *l, BYTE *frame, const DWORD *v)
+{
+    for (int i = 0; i < l->nslots; i++)
+        if (l->slots[i][1] == 4)
+            *(DWORD *)(frame + l->slots[i][0]) = v[i];
+        else
+            frame[l->slots[i][0]] = (BYTE)v[i];
+    if (l->first >= 0)
+        *(DWORD *)(frame + l->first) = v[l->nslots];
+}
+
+/* Run slices from..k-1 of candidates lo..hi-1 of the scan at esp on the workers, each from a copy of the frame
+ * (with the flag set if set_flag), and wait for them. */
+static void scan_run(struct scan_loop *l, DWORD *esp, int from, int k, int lo, int hi, int set_flag)
+{
+    WORD cw;
+    DWORD mx, base = esp[l->cand / 4];
+    __asm__ volatile("fnstcw %0\n\tstmxcsr %1" : "=m"(cw), "=m"(mx));
+    HANDLE done[SCAN_MAX];
+    for (int s = from; s < k; s++) {
+        struct scan_job *job = &scan_jobs[s];
+        int start = lo + (int)((long long)(hi - lo) * s / k), end = lo + (int)((long long)(hi - lo) * (s + 1) / k);
+        memcpy(job->frame, esp, SCAN_FRAME);
+        *(int *)(job->frame + l->index) = start;
+        *(int *)(job->frame + l->end) = end;
+        *(DWORD *)(job->frame + l->cand) = base + start * 0x14;
+        if (set_flag)
+            job->frame[l->flag] = 1;
+        for (int i = 0; i < 8; i++)
+            job->regs[i] = esp[-8 + i];
+        if (l->cand_reg >= 0)
+            job->regs[l->cand_reg] = base + start * 0x14;
+        job->regs[3] = l->head;
+        job->align = (DWORD)esp & 15;
+        job->fpucw = cw, job->mxcsr = mx;
+        job->st.stream = 1, job->st.cand = -1, job->st.gate = 0;
+        job->st.seeded[0] = job->st.seeded[1] = -1;
+        job->st.ph_cand[0] = job->st.ph_cand[1] = -1;
+        done[s - from] = job->done;
+        SetEvent(job->go);
+    }
+    WaitForMultipleObjects(k - from, done, TRUE, INFINITE);
+}
+
+/* Fill in the guarded singleton statics the registry can already give, as their first use would. */
+static void scan_fill_singletons(void)
+{
+    for (unsigned i = 0; i < sizeof singletons / sizeof *singletons; i++) {
+        const struct singleton *g = &singletons[i];
+        if (*(volatile DWORD *)g->guard & g->bit)
+            continue;
+        DWORD v = ((DWORD (__cdecl *)(DWORD))0x983800)(g->id_kind ? *(const BYTE *)g->id : g->id);
+        if (v) {
+            *(volatile DWORD *)g->value = v;
+            *(volatile DWORD *)g->guard |= g->bit;
+        }
+    }
+}
+
+/* Game thread, at the first loop head of a big scan: run it on the workers. Returns 1 if the loop is done (the
+ * result is in the frame), 0 to run it here after all. */
+static int scan_parallel(struct scan_loop *l, DWORD *esp)
+{
+    BYTE *frame = (BYTE *)esp;
+    int count = esp[l->end / 4], k = cfg.par_scan;
+    DWORD base = esp[l->cand / 4];
+    if (l->cand_reg >= 0 && base != esp[-8 + l->cand_reg])
+        return 0; /* not the expected loop state */
+    if (k > count / 256)
+        k = count / 256;
+    if (k < 2)
+        return 0;
+    DWORD draw = ((DWORD (__attribute__((thiscall)) *)(DWORD, int))0x983ae0)(SCAN_RNG, 0x40000000);
+    scan_seed = scan_mix(draw ^ scan_scans++ * 0x9e3779b1);
+    scan_fill_singletons();
+    scan_prepare_areas(k);
+    /* With a flag, the first SCAN_PREFIX candidates run alone first: when a scan sets the flag, it does so there in
+     * 99.7% of cases, so the other slices can start with the right value. */
+    static BYTE prefix[SCAN_FRAME];
+    struct scan_thread pre_ph = {.ph_cand = {-1, -1}}; /* the prefix's placeholder sets */
+    int lo = 0, flag = l->flag >= 0 && frame[l->flag];
+    if (l->flag >= 0 && !flag) {
+        lo = count / 8 < SCAN_PREFIX ? count / 8 : SCAN_PREFIX;
+        scan_run(l, esp, 0, 1, 0, lo, 0);
+        memcpy(prefix, scan_jobs[0].frame, SCAN_FRAME);
+        flag = prefix[l->flag];
+        for (int f = 0; f < 2; f++)
+            pre_ph.ph_cand[f] = scan_jobs[0].st.ph_cand[f], pre_ph.ph_off[f] = scan_jobs[0].st.ph_off[f],
+            pre_ph.ph_val[f] = scan_jobs[0].st.ph_val[f];
+    }
+    scan_run(l, esp, 0, k, lo, count, flag);
+    if (l->flag >= 0 && !flag) /* set after the prefix: rerun the slices after the first that set it, with it set */
+        for (int s = 0; s < k - 1; s++)
+            if (scan_jobs[s].frame[l->flag]) {
+                scan_run(l, esp, s + 1, k, lo, count, 1);
+                break;
+            }
+    DWORD res[6], v[6];
+    scan_get(l, frame, res);
+    int fallback = 0;
+    for (int s = lo ? -1 : 0; s < k; s++) { /* in candidate order: the prefix, then the slices */
+        scan_get(l, s < 0 ? prefix : scan_jobs[s].frame, v);
+        if ((int)v[1] >= 0 && (int)v[0] > (int)res[0])
+            memcpy(res, v, l->nslots * sizeof *v);
+        if (v[l->nslots] && !fallback)
+            res[l->nslots] = v[l->nslots], fallback = 1;
+    }
+    for (int f = 0; f < 2; f++) { /* the placeholder's last set, in candidate order */
+        const struct scan_thread *last = pre_ph.ph_cand[f] >= 0 ? &pre_ph : NULL;
+        for (int s = 0; s < k; s++)
+            if (scan_jobs[s].st.ph_cand[f] > (last ? last->ph_cand[f] : -1))
+                last = &scan_jobs[s].st;
+        if (last && SCAN_PLACEHOLDER)
+            *(DWORD *)(SCAN_PLACEHOLDER + last->ph_off[f]) = last->ph_val[f];
+    }
+    scan_put(l, frame, res);
+    *(int *)(frame + l->index) = count;
+    *(DWORD *)(frame + l->cand) = base + count * 0x14;
+    return 1;
+}
+
+/* The loop heads' stubs: per-thread candidate tracking, prefetch, and the split. */
+static int scan_head(struct scan_loop *l, DWORD *esp)
+{
+    struct scan_thread *t = scan_self();
+    int index = esp[l->index / 4];
+    if (t && t->base == (DWORD)esp)
+        t->cand = index;
+    if (cfg.prefetch)
+        (l == scan_loops ? pf_candidate : pf_loan_candidate)(esp);
+    if (t != &scan_main || t->base || index)
+        return 0;
+    if (SCAN_PLACEHOLDER != scan_warm_ph) /* a save was loaded: warm up again */
+        scan_warm_ph = SCAN_PLACEHOLDER, scan_loops[0].warm = scan_loops[1].warm = 0;
+    if ((int)esp[l->end / 4] >= SCAN_MIN && l->warm++ >= SCAN_WARMUP && GetCurrentThreadId() == game_thread_id &&
+        !(scan_lock.RecursionCount && (DWORD)(DWORD_PTR)scan_lock.OwningThread == game_thread_id)) /* the workers need it */
+        return scan_parallel(l, esp);
+    return 0;
+}
+int __cdecl scan_head_main(DWORD *esp) __asm__("scan_head_main");
+int __cdecl scan_head_main(DWORD *esp) { return scan_head(&scan_loops[0], esp); }
+int __cdecl scan_head_loan(DWORD *esp) __asm__("scan_head_loan");
+int __cdecl scan_head_loan(DWORD *esp) { return scan_head(&scan_loops[1], esp); }
+
+/* The loop exits' stub: on a worker, at its slice's frame, the slice is done (returns its job). */
+DWORD __cdecl scan_exit(DWORD *esp) __asm__("scan_exit");
+DWORD __cdecl scan_exit(DWORD *esp)
+{
+    struct scan_thread *t = scan_self();
+    if (!t || t == &scan_main || t->base != (DWORD)esp)
+        return 0;
+    struct scan_job *job = (struct scan_job *)((BYTE *)t - offsetof(struct scan_job, st));
+    memcpy(job->frame, esp, SCAN_FRAME);
+    return (DWORD)job;
+}
+
+/* stubs: pushad; pushfd; push esp-before; call fn; then either replay the hooked instructions and go on, or (loop
+ * head) go to the loop's exit, or (loop exit, on a worker) leave the slice */
+DWORD scan_cont[4] __asm__("scan_cont") = {SCAN_HEAD + 6, SCAN_EXIT, SCAN_LOAN_HEAD + 8, SCAN_LOAN_EXIT};
+DWORD scan_exit_cont[2] __asm__("scan_exit_cont") = {SCAN_EXIT + 7, SCAN_LOAN_EXIT + 7};
+void scan_head_stub(void) __asm__("scan_head_stub");
+__asm__("scan_head_stub:\n"
+        "pushal\npushfl\nlea 0x24(%esp),%eax\npush %eax\ncall scan_head_main\nadd $4,%esp\ntest %eax,%eax\njnz 1f\n"
+        "popfl\npopal\nmov 0x70(%esp),%esi\nmov (%esi),%ecx\njmp *scan_cont\n"
+        "1:\npopfl\npopal\njmp *scan_cont+4\n");
+void scan_loan_head_stub(void) __asm__("scan_loan_head_stub");
+__asm__("scan_loan_head_stub:\n"
+        "pushal\npushfl\nlea 0x24(%esp),%eax\npush %eax\ncall scan_head_loan\nadd $4,%esp\ntest %eax,%eax\njnz 1f\n"
+        "popfl\npopal\nmov 0x28(%esp),%edx\nmov 0x44(%esp),%ecx\njmp *scan_cont+8\n"
+        "1:\npopfl\npopal\njmp *scan_cont+12\n");
+void scan_exit_stub(void) __asm__("scan_exit_stub");
+__asm__("scan_exit_stub:\n"
+        "pushal\npushfl\nlea 0x24(%esp),%eax\npush %eax\ncall scan_exit\nadd $4,%esp\ntest %eax,%eax\njnz scan_leave_slice\n"
+        "popfl\npopal\nmov 0x7c(%esp),%esi\ncmp $-1,%esi\njmp *scan_exit_cont\n");
+void scan_loan_exit_stub(void) __asm__("scan_loan_exit_stub");
+__asm__("scan_loan_exit_stub:\n"
+        "pushal\npushfl\nlea 0x24(%esp),%eax\npush %eax\ncall scan_exit\nadd $4,%esp\ntest %eax,%eax\njnz scan_leave_slice\n"
+        "popfl\npopal\nmov 0x40(%esp),%edi\ncmp $-1,%edi\njmp *scan_exit_cont+4\n");
+
+/* The thunk for one site. r, a register the instruction doesn't use (or the target register of kind 1), gets the
+ * thread's area, or the globals' address minus the block's area offset when there is none; then the instruction
+ * runs with [r + area offset + (target - block)] in place of [target]. Flags are kept: the test is between pushfd
+ * and popfd, and popfd comes before the instruction, which may set them itself. Returns the thunk's end, or NULL
+ * for a form it can't rewrite. */
+static BYTE *scan_thunk(BYTE *q, const struct scan_site *p)
+{
+    const BYTE *code = (const BYTE *)p->addr;
+    DWORD off = scan_area_off[p->block] + (p->target - scan_blocks[p->block][0]);
+    DWORD fallback = scan_blocks[p->block][0] - scan_area_off[p->block];
+    int form = 0, at = p->pos, used = 1 << 4, r = p->reg; /* form: 1 modrm disp32, 2 SIB without base, 3 moffs */
+    if (p->kind == 0 || p->kind == 3) {
+        static const int prefer[] = {3, 6, 7, 2, 1, 5, 0};
+        if ((code[at - 1] & 0xc7) == 0x05)
+            form = 1, used |= 1 << (code[at - 1] >> 3 & 7);
+        else if (at >= 2 && (code[at - 2] & 0xc7) == 0x04 && (code[at - 1] & 7) == 5)
+            form = 2, used |= 1 << (code[at - 2] >> 3 & 7) | 1 << (code[at - 1] >> 3 & 7);
+        else if (code[at - 1] >= 0xa0 && code[at - 1] <= 0xa3)
+            form = 3, used |= 1;
+        else
+            return NULL;
+        r = -1;
+        for (int i = 0; i < 7 && r < 0; i++)
+            if (!(used >> prefer[i] & 1))
+                r = prefer[i];
+        if (r < 0)
+            return NULL;
+    } else if (p->kind == 2) {
+        r = 0;                                                         /* push imm32: the address, via eax */
+        *q++ = 0x8d, *q++ = 0x64, *q++ = 0x24, *q++ = 0xfc;            /* lea esp,[esp-4]: room for it */
+    }
+    if (p->kind != 1)
+        *q++ = 0x50 + r;                                               /* push r */
+    *q++ = 0x9c;                                                       /* pushfd */
+    *q++ = 0x64, *q++ = 0x8b, *q++ = 0x05 | r << 3;                    /* mov r,fs:[TlsSlots[slot]] */
+    *(DWORD *)q = 0xe10 + 4 * scan_area_slot, q += 4;
+    *q++ = 0x85, *q++ = 0xc0 | r << 3 | r;                             /* test r,r */
+    *q++ = 0x75, *q++ = 5;                                             /* jnz +5 */
+    *q++ = 0xb8 + r, *(DWORD *)q = fallback, q += 4;                   /* mov r,fallback */
+    *q++ = 0x9d;                                                       /* popfd */
+    if (p->kind == 1) {                                                /* lea r,[r+off] */
+        *q++ = 0x8d, *q++ = 0x80 | r << 3 | r, *(DWORD *)q = off, q += 4;
+    } else if (p->kind == 2) {                                         /* lea eax,[eax+off]; mov [esp+4],eax; pop eax */
+        *q++ = 0x8d, *q++ = 0x80, *(DWORD *)q = off, q += 4;
+        *q++ = 0x89, *q++ = 0x44, *q++ = 0x24, *q++ = 0x04;
+        *q++ = 0x58;
+    } else {
+        if (form == 3) {                                               /* mov al/eax <-> [moffs], as modrm forms */
+            memcpy(q, code, at - 1), q += at - 1;
+            *q++ = (BYTE[]){0x8a, 0x8b, 0x88, 0x89}[code[at - 1] - 0xa0];
+            *q++ = 0x80 | r;
+        } else if (form == 1) {
+            memcpy(q, code, at - 1), q += at - 1;
+            *q++ = 0x80 | (code[at - 1] & 0x38) | r;
+        } else {
+            memcpy(q, code, at - 2), q += at - 2;
+            *q++ = 0x84 | (code[at - 2] & 0x38);
+            *q++ = (code[at - 1] & 0xf8) | r;
+        }
+        *(DWORD *)q = off, q += 4;
+        memcpy(q, code + at + 4, p->len - at - 4), q += p->len - at - 4; /* an immediate, if any */
+        *q++ = 0x58 + r;                                               /* pop r */
+    }
+    *q++ = 0xe9;
+    *(DWORD *)q = (p->addr + p->len) - (DWORD)(q + 4);
+    return q + 4;
+}
+
+static int scan_patch_sites(void)
+{
+    int n = sizeof scan_sites / sizeof *scan_sites;
+    BYTE *t = VirtualAlloc(NULL, n * 48, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!t)
+        return 0;
+    for (int i = 0; i < n; i++) {
+        const struct scan_site *p = &scan_sites[i];
+        const BYTE *code = (const BYTE *)p->addr;
+        BYTE *end;
+        if (*(const DWORD *)(code + p->pos) != p->target || (p->kind == 1 && code[0] != 0xb8 + p->reg) ||
+            (p->kind == 2 && code[0] != 0x68) || !(end = scan_thunk(t + 48 * i, p)) || end > t + 48 * (i + 1))
+            return 0;
+    }
+    DWORD old;
+    if (!VirtualProtect((void *)0x401000, 0x6b5000, PAGE_EXECUTE_READWRITE, &old))
+        return 0;
+    for (int i = 0; i < n; i++) {
+        BYTE *code = (BYTE *)scan_sites[i].addr;
+        code[0] = 0xe9;
+        *(DWORD *)(code + 1) = (DWORD)(t + 48 * i) - ((DWORD)code + 5);
+        memset(code + 5, 0xcc, scan_sites[i].len - 5);
+    }
+    VirtualProtect((void *)0x401000, 0x6b5000, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void *)0x401000, 0x6b5000);
+    return 1;
+}
+
+/* 0x6df070 (thiscall person, no stack arguments): the person's virtual-player view, from VIRTUAL_MANAGER's 200-slot
+ * cache (0x6def70). It is looked up for nearly every candidate (2.4 billion times in a 13-month holiday), and on a hit
+ * the cache only reads: the view at person+0x10 is current if its id matches the person's, both read through slot +8
+ * of their virtual base, which for both classes seen (VIRTUAL_PLAYER, ACTUAL_PLAYER) is 0x754c70, `return this->id`
+ * at +4. So a hit is checked here without the lock; a miss, or any other id function, takes the lock and the
+ * original. A view can be rebuilt for another person while a caller still uses it, with or without the lock (the
+ * caller holds it after the call): with 200 slots and about one build per 300 scans that doesn't happen. */
+typedef DWORD (__attribute__((thiscall)) *vp_fn)(DWORD);
+static vp_fn scan_vp_orig;
+static DWORD scan_vb(DWORD obj) /* the virtual base, or 0 if its id function isn't 0x754c70 */
+{
+    DWORD vb = obj + *(DWORD *)(*(DWORD *)(obj + 4) + 4) + 4;
+    return *(DWORD *)(*(DWORD *)vb + 8) == 0x754c70 ? vb : 0;
+}
+static DWORD __attribute__((thiscall)) scan_vp(DWORD person)
+{
+    DWORD view = *(volatile DWORD *)(person + 0x10), a, b;
+    if (view && *(volatile DWORD *)0xd54ea8 & 1 && *(volatile DWORD *)0xd54ea4 && (a = scan_vb(person)) && (b = scan_vb(view)) &&
+        *(volatile DWORD *)(a + 4) == *(volatile DWORD *)(b + 4))
+        return view;
+    EnterCriticalSection(&scan_lock);
+    DWORD r = scan_vp_orig(person);
+    LeaveCriticalSection(&scan_lock);
+    return r;
+}
+
+static int install_par_scan(void)
+{
+    if (cfg.par_scan > SCAN_MAX)
+        cfg.par_scan = SCAN_MAX;
+    InitializeCriticalSectionAndSpinCount(&scan_lock, 4000); /* held briefly: spin before sleeping */
+    if (!cfg.par_matches)
+        InitializeCriticalSection(&par_rng_lock);
+    if ((scan_tls = TlsAlloc()) == TLS_OUT_OF_INDEXES || (scan_area_slot = TlsAlloc()) >= 64) /* in the TEB itself */
+        return 0;
+    TlsSetValue(scan_tls, &scan_main);
+    if (memcmp((void *)SCAN_HEAD, "\x8b\x74\x24\x70\x8b\x0e", 6) || memcmp((void *)SCAN_EXIT, "\x8b\x74\x24\x7c\x83\xfe\xff", 7) ||
+        memcmp((void *)SCAN_LOAN_HEAD, "\x8b\x54\x24\x28\x8b\x4c\x24\x44", 8) ||
+        memcmp((void *)SCAN_LOAN_EXIT, "\x8b\x7c\x24\x40\x83\xff\xff", 7) ||
+        memcmp((void *)0x75fde0, "\x8b\x44\x24\x04\x89\x41\x84", 7) || memcmp((void *)0x65eb30, "\x8b\x44\x24\x04\x89\x81\x6c\xff\xff\xff", 10))
+        return 0;
+    /* 0x983ae0: original, or par_matches' jmp to par_rand */
+    BYTE *r = (BYTE *)0x983ae0;
+    if (r[0] == 0xe9 && (DWORD)r + 5 + *(int *)(r + 1) == (DWORD)par_rand) {
+        DWORD old;
+        VirtualProtect(r, 5, PAGE_EXECUTE_READWRITE, &old);
+        *(DWORD *)(r + 1) = (DWORD)scan_rand - ((DWORD)r + 5);
+        VirtualProtect(r, 5, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), r, 5);
+    } else if (!patch_jmp(0x983ae0, "\x83\xc1\x04\xe9", 4, scan_rand))
+        return 0;
+    BYTE *tg = make_tramp(SCAN_GATE, 7);
+    if (!tg)
+        return 0;
+    scan_gate_orig = (gate_fn)tg;
+    if (!(scan_patch_sites() &&
+          (scan_vp_orig = (vp_fn)make_tramp(0x6df070, 6)) && patch_jmp(0x6df070, "\x64\xa1\x00\x00\x00\x00", 6, scan_vp) &&
+          patch_jmp(SCAN_GATE, "\x6a\xff\x68\x90\xe3\xa6\x00", 7, scan_gate) &&
+          probe(0x75fde0, 7, scan_set7c) && probe(0x65eb30, 10, scan_set94)))
+        return 0;
+    for (int i = 0; i < cfg.par_scan; i++) {
+        struct scan_job *job = &scan_jobs[i];
+        job->go = CreateEventA(NULL, FALSE, FALSE, NULL);
+        job->done = CreateEventA(NULL, FALSE, FALSE, NULL);
+        job->thread = CreateThread(NULL, 4 << 20, scan_worker, job, STACK_SIZE_PARAM_IS_A_RESERVATION, &job->id);
+        if (!job->go || !job->done || !job->thread)
+            return 0;
+    }
+    return patch_jmp(SCAN_EXIT, "\x8b\x74\x24\x7c\x83\xfe\xff", 7, scan_exit_stub) &&
+           patch_jmp(SCAN_HEAD, "\x8b\x74\x24\x70\x8b\x0e", 6, scan_head_stub) &&
+           patch_jmp(SCAN_LOAN_EXIT, "\x8b\x7c\x24\x40\x83\xff\xff", 7, scan_loan_exit_stub) &&
+           patch_jmp(SCAN_LOAN_HEAD, "\x8b\x54\x24\x28\x8b\x4c\x24\x44", 8, scan_loan_head_stub);
 }
 
 static int patch_slot(DWORD va, void *hook, void **real, const char *dll, const char *fn)
@@ -1584,6 +2225,9 @@ static void load_config(const char *dir)
     cfg.par_matches = GetPrivateProfileIntA("cmscale", "par_matches", 8, ini);
     if (cfg.par_matches < 0)
         cfg.par_matches = 0;
+    cfg.par_scan = GetPrivateProfileIntA("cmscale", "par_scan", 8, ini);
+    if (cfg.par_scan < 0)
+        cfg.par_scan = 0;
     cfg.idle_wait = GetPrivateProfileIntA("cmscale", "idle_wait", 1, ini);
     cfg.fast_sqrt = GetPrivateProfileIntA("cmscale", "fast_sqrt", 1, ini);
     cfg.fast_rand = GetPrivateProfileIntA("cmscale", "fast_rand", 2, ini);
@@ -1646,6 +2290,8 @@ static void install(void)
         install_prefetch();
     if (cfg.par_matches)
         install_par();
+    if (cfg.par_scan)
+        install_par_scan();
     if (cfg.match_speed_max != 8 && VERY_FAST_SPEED == 8.0)
         VERY_FAST_SPEED = cfg.match_speed_max;
     if (cfg.match_hl_speed)

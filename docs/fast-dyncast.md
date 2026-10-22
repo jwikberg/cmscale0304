@@ -28,6 +28,13 @@ cmscale hooks the import slot for `__RTDynamicCast` (`0xab61f8`).
 A verify mode called the runtime on every cast and compared its answer with the table's. A full holiday made
 1 174 371 867 casts. All but 141 were table hits, and none disagreed with the runtime.
 
+## Threads
+
+With `par_matches` and `par_scan`, casts run on several threads at once. Each table entry has a sequence number that is
+odd while the entry is being written. A reader that sees it odd, or sees it change while it reads, treats the entry as a
+miss and asks the runtime. A writer claims the entry with a compare-and-exchange, and skips caching if another thread
+got there first. Without that, two threads could tear an entry, and a cast could return a wrong pointer.
+
 ## Measured
 
 | Three-month holiday | Wall | CPU |

@@ -34,12 +34,22 @@ These tools lived in a research build of cmscale. The public DLL doesn't include
   return address into the exe that it finds on the stack. The exe omits frame pointers, so the profiler scans the
   stack and counts a value only if a `call` instruction ends right before it. Every 250 ms it also records the game
   thread's CPU time and how often the message loop and the present ran. That tells computing apart from waiting and
-  idling. Linux `perf`, attached to the Wine process, gave the same ranking and shares.
+  idling. It also records the game date whenever it changes, so a long holiday's profile can be split by game day.
+  Linux `perf`, attached to the Wine process, gave the same ranking and shares.
 - **Call counters.** A trampoline counts the calls to any function.
-- **A write watch.** For the length of one match simulation, or one club's shortlisting, the watch makes the exe's
-  data and all heap memory read-only. It then logs every write outside the match's own memory, with the writing
-  instruction, the registers and the vtable of the object written. An option single-steps each write, so the watch
-  sees every write instead of only the first per page.
+- **A write watch.** For the length of one match simulation, one club's shortlisting or one AI transfer search, the
+  watch makes the exe's data and all heap memory read-only. It then logs every write outside the watched code's own
+  memory, with the writing instruction, the registers and the vtable of the object written. An option single-steps
+  each write, so the watch sees every write instead of only the first per page.
+- **A person probe.** During a transfer search, it records the candidate being scored and every object the search's
+  scratch writers get, resolved to the complete object through RTTI. It showed which objects two different
+  candidates touch.
+- **A search verify mode.** Each search split over threads also ran on the game thread with the same random streams,
+  and the results were compared.
+- **A batch trace.** One line per batch of background matches: its place in the fixture list, the waits and each
+  simulation's own time. Offline it compared batching policies.
+- **A lock contention counter.** It counted how often a lock had to wait, which showed when a lock cost more than
+  splitting the work saved.
 - **Hardware data breakpoints.** The debug registers on one field found every instruction that reads it.
 - **Match fingerprints and pinned seeds.** The research build logged one line per simulated match, with its seeds and
   a hash of its random number generator's final state. With the seeds and the clock pinned, two runs gave identical
@@ -63,7 +73,8 @@ state. A control run with a deliberately broken patch showed that the test catch
 - The host was an AMD Ryzen AI 9 365 with 4 Zen 5 and 6 Zen 5c cores, 20 threads.
 - Two saves were used. The first is a pre-season save (Fulham, 13 Jul 2003), whose first Continue runs to 16 Jul
   19:45. The second is a 57 MB save with England down to the Third Division, Spain down to the Second and Sweden's
-  First, with an unemployed manager. It was used for a three-month holiday from 13 Jul to 20 Oct 2003.
+  First, with an unemployed manager. It was used for a three-month holiday from 13 Jul to 20 Oct 2003, and for a
+  13-month holiday to 13 Aug 2004. The save from the end of that holiday (140 MB) gave tests in the new season.
 
 Single runs of long benchmarks vary by 2–3%, because the game isn't deterministic. It seeds each match from
 `GetTickCount`.

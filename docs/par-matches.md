@@ -55,11 +55,12 @@ before patching it.
 
 **Fixtures run in batches.** The day loop's `call 0x61b7b0` at `0x61cdd4` becomes a call to `play_async`:
 
-1. A worker thread runs the whole of `0x61b7b0` and stops when it reaches the simulation.
+1. A worker thread runs the whole of `0x61b7b0` and stops when it reaches the simulation. Fixtures that finish
+   without a simulation finish there.
 2. The game thread returns to the day loop, which moves on to the next fixture.
-3. The batch runs every K fixtures (K is `par_matches`), at the end of each fixture list, and whenever the game thread
-   plays a fixture itself. The K simulations run together while the game thread waits. Then each worker records its
-   fixture in turn, and the game thread shows its score.
+3. The batch runs at the end of each fixture list, after 64 fixtures, and whenever the game thread plays a fixture
+   itself. The game thread starts the simulations in fixture order, K at a time (K is `par_matches`), and starts the
+   next as soon as one ends. Then each worker records its fixture in turn, and the game thread shows its score.
 
 Only simulations ever run at the same time, never other game code. Each worker copies the game thread's x87 control
 word and MXCSR and gets a 1 MB stack, like the game thread. The match the human manager watches always stays on the
@@ -96,6 +97,21 @@ With K above 1, the results differ from a serial run. cmscale sets up all of a b
 first of them, while the stock game sets each one up after it records the previous one. For fixtures between different
 clubs on one day that shouldn't matter, but it is the one difference.
 
+## Batches and fixture lists
+
+A trace of every batch over a three-month holiday showed where the waiting went:
+
+- A batch waits for its slowest match.
+- The first version ended a batch after K fixtures. Many fixtures finish without the match engine, so a batch of 8
+  fixtures often held one or two simulations, and the other threads idled. Over the first 400 batches, 180 held no
+  simulation, 81 held one and 46 held a full 8.
+- Most fixture lists are tiny (104 of 268 had no simulation, 81 had one), but 38 lists with more than 8 simulations
+  held 1 017 of the 1 253 simulations.
+
+Hence the queue: a batch now takes a whole fixture list, and the threads take the next simulation as soon as they're
+free. A batch can't span fixture lists. At the end of a list, the day loop asks the game's internal server for the next
+one, and the server's work in between can depend on the results.
+
 ## Measured
 
 | Three-month holiday | `par_matches=0` | 4 | 6 | 8 | 12 | 16 |
@@ -103,9 +119,13 @@ clubs on one day that shouldn't matter, but it is the one difference.
 | Wall | 804 s | 633 s | 608 s | 638 s | 603 s | 593 s |
 
 - From 4 threads up, the differences are within the noise between runs. The default is 8.
-- The rest of the day sets the limit. The game thread still spends about 450 s on other work, mostly the AI's shortlist
-  scan (see [prefetch](prefetch.md)).
-- A batch also ends with each fixture list, so many batches hold fewer than K fixtures.
+- The queue per fixture list took a further 3% off a three-month holiday with `par_scan=8`: 375 and 379 s, against
+  388–391 s with batches of 8 fixtures. With 12 or 16 threads each simulation got slower and the wait stayed the
+  same: the simulations are bound by memory, and the test machine has 4 fast cores.
+- With the queue, the first Continue on the pre-season save gave identical fingerprints for the 52 matches both runs
+  simulated, against the same schedule run one at a time.
+- The rest of the day sets the limit. The game thread still spent about 450 s on other work, mostly the AI's shortlist
+  scan, which [par_scan](par-scan.md) now splits too.
 - The tests ran 1 251 background matches without a crash, and normal play confirmed it.
 - Creating a new game gains nothing. Its pre-season fixtures are quick results that never reach the match engine.
 
