@@ -75,13 +75,14 @@ static struct {
     int prefetch;       /* prefetch shortlist candidates' data ahead of the AI's scan */
     int par_matches;    /* simulate background matches on this many threads */
     int par_scan;       /* split the AI's transfer and loan searches over this many threads */
+    int threads;        /* the default for par_matches and par_scan; 0 = both off */
     int skip_splash;    /* skip the logos at startup, as a key press during them does */
     int mouse_nav;      /* mouse back/forward buttons go back/forward through the screen history */
     int match_hl_speed; /* the watched match's highlights: 0 = stock (Real Time), 1 = Fast (3x), 2 = Very Fast (8x) */
     int match_speed_max; /* the watched match's Very Fast speed (stock 8) */
 } cfg = {
     .zoom = 1.0, .borderless = 1, .filter = FILTER_SHARP, .opengl = 1, .max_fps = 60, .cursor_fix = 1,
-    .fast_sqrt = 1, .fast_rand = 2, .idle_wait = 1, .fast_dyncast = 1, .prefetch = 1, .par_matches = 8, .par_scan = 8,
+    .fast_sqrt = 1, .fast_rand = 2, .idle_wait = 1, .fast_dyncast = 1, .prefetch = 1, .par_matches = 8, .par_scan = 8, .threads = 8,
     .skip_splash = 1, .mouse_nav = 1, .match_speed_max = 8,
 };
 
@@ -2258,6 +2259,18 @@ static int install_match_hl_speed(void)
     return !memcmp((void *)LIVE_ARM_AT, "\x8d\x8e\x20\x2c\x00\x00", 6) && probe(LIVE_ARM_AT, 6, live_arm);
 }
 
+/* Logical processors the process may run on (its affinity mask) */
+static int cpu_threads(void)
+{
+    DWORD_PTR mask, sys;
+    int n = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &mask, &sys))
+        return 1;
+    for (; mask; mask &= mask - 1)
+        n++;
+    return n ? n : 1;
+}
+
 static void load_config(const char *dir)
 {
     char ini[MAX_PATH + 16], buf[32];
@@ -2277,10 +2290,20 @@ static void load_config(const char *dir)
     cfg.cursor_fix = GetPrivateProfileIntA("cmscale", "cursor_fix", 1, ini);
     cfg.prefetch = GetPrivateProfileIntA("cmscale", "prefetch", 1, ini);
     cfg.fast_dyncast = GetPrivateProfileIntA("cmscale", "fast_dyncast", 1, ini);
-    cfg.par_matches = GetPrivateProfileIntA("cmscale", "par_matches", 8, ini);
+    /* threads: the worker threads for par_matches and par_scan, which never run at the same time (each runs while the
+     * game thread waits for it). Default: the logical processors this process may run on, at most 8 (on 4 cores with
+     * two threads each, 8 was 12% faster than 4); below 2, off. par_matches and par_scan override it for one of them. */
+    char tbuf[16];
+    GetPrivateProfileStringA("cmscale", "threads", "auto", tbuf, sizeof tbuf, ini);
+    cfg.threads = !_stricmp(tbuf, "auto") || !*tbuf ? -1 : atoi(tbuf);
+    if (cfg.threads < 0)
+        cfg.threads = cpu_threads() < 8 ? cpu_threads() : 8;
+    if (cfg.threads < 2)
+        cfg.threads = 0;
+    cfg.par_matches = GetPrivateProfileIntA("cmscale", "par_matches", cfg.threads, ini);
     if (cfg.par_matches < 0)
         cfg.par_matches = 0;
-    cfg.par_scan = GetPrivateProfileIntA("cmscale", "par_scan", 8, ini);
+    cfg.par_scan = GetPrivateProfileIntA("cmscale", "par_scan", cfg.threads, ini);
     if (cfg.par_scan < 0)
         cfg.par_scan = 0;
     cfg.idle_wait = GetPrivateProfileIntA("cmscale", "idle_wait", 1, ini);

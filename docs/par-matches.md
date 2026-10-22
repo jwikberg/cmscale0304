@@ -1,6 +1,6 @@
 # Background matches on threads
 
-Option: `par_matches` (default 8, up to 16; 0 turns it off).
+Option: `par_matches` (default: `threads`, which is `auto`, the CPU's threads up to 8; up to 16; 0 turns it off).
 
 ## The question
 

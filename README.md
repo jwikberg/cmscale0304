@@ -23,7 +23,7 @@ game.
 - **Windows 10 or later, or Wine/Proton.** The DLL uses the Universal C Runtime, which Windows 10 includes. Windows 7
   and 8 need the UCRT update.
 - **A CPU with SSE2** for the speed options. Every x86 CPU from the last 20 years has it. `par_matches` needs 4 or
-  more cores to help, and so does `par_scan`.
+  more threads to help, and so does `par_scan`.
 
 cmscale was developed and tested under Wine/Proton on Linux. Nobody has tested it on Windows yet.
 
@@ -73,8 +73,13 @@ thing, or they change only what the CPU does while it waits.
 
 | Option | Default | What it does | Docs |
 |---|---|---|---|
-| `par_matches` | `8` | Simulates the day's background matches on this many threads, up to 16. `0` turns it off. A three-month holiday takes about 21% less time | [par-matches](docs/par-matches.md) |
-| `par_scan` | `8` | Splits the AI's transfer and loan searches, which score every player in the database, over this many threads, up to 16. `0` turns it off. Long holidays take about 28% less time, transfer windows about 35% less | [par-scan](docs/par-scan.md) |
+| `threads` | `auto` | Worker threads for both options below. `auto` uses as many as the CPU has threads, up to 8. `0` turns both off | |
+| `par_matches` | `threads` | Simulates the day's background matches on this many threads, up to 16. `0` turns it off. A three-month holiday takes about 21% less time | [par-matches](docs/par-matches.md) |
+| `par_scan` | `threads` | Splits the AI's transfer and loan searches, which score every player in the database, over this many threads, up to 16. `0` turns it off. Long holidays take about 28% less time, transfer windows about 35% less | [par-scan](docs/par-scan.md) |
+
+Usually you only need `threads`. The two work at different moments, never at once, so one thread count suits both.
+Set `par_matches` or `par_scan` only to override one of them, for example `par_scan=0`. On a 4-core CPU with two
+threads per core, 8 threads ran a two-week holiday 12% faster than 4. On 4 cores without that, 4 and 8 were the same.
 
 Results with these options differ from a run without them. Two stock runs differ from each other too, because the game
 seeds each match from the clock and its random number generator depends on timing. With `par_matches`, the simulation

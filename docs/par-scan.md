@@ -1,6 +1,6 @@
 # The AI's transfer searches on threads
 
-Option: `par_scan` (default 8, up to 16; 0 turns it off).
+Option: `par_scan` (default: `threads`, which is `auto`, the CPU's threads up to 8; up to 16; 0 turns it off).
 
 ## The question
 
@@ -142,8 +142,18 @@ first time a club is set up.
 | 13 months, 13 Jul 2003 to 13 Aug 2004 | 1 629 s | 1 175 s (−28%) |
 | Creating a new game with every league | 413 s | 431 s (its searches stay on the game thread) |
 
-By month in the 13-month run, transfer windows took 31–40% less time and quiet months 8–26% less. 4 threads give
-most of the gain, about −29% on the July fortnight, and 8 a little more.
+By month in the 13-month run, transfer windows took 31–40% less time and quiet months 8–26% less.
+
+**Thread counts** (13–27 Jul 2003, all defaults, `threads` setting both options; other CPUs simulated with `taskset`):
+
+| CPU | `threads=0` | 4 | 8 |
+|---|---|---|---|
+| 4 cores, 2 threads each | 101.3 s | 55.1, 54.2 s | 47.9, 48.4 s |
+| 4 cores, 1 thread each | | 61.1, 62.1 s | 62.9, 59.3 s |
+| the test machine (10 cores, 20 threads) | | | 52.1, 52.3 s |
+
+The second thread of a core helps by about 12%, and more threads than the CPU has neither help nor hurt much. So
+`threads=auto` takes the CPU's threads, up to 8.
 
 ## Limits
 
